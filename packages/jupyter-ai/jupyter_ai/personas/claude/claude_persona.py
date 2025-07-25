@@ -190,26 +190,31 @@ class ClaudePersona(BasePersona):
             async def claude_code_stream():
                 messages = []
                 full_response = ""
+                message_count = 0
                 
                 try:
+                    self.log.info("🚀 Starting Claude Code streaming...")
                     async for msg in query(prompt=full_prompt, options=options):
+                        message_count += 1
+                        self.log.debug(f"📨 Received message #{message_count}: {type(msg).__name__}")
                         messages.append(msg)
                         
-                        # Extract content from the message object and yield it
-                        content = ""
-                        if hasattr(msg, 'content') and msg.content:
-                            content = str(msg.content)
-                        elif hasattr(msg, 'text') and msg.text:
-                            content = str(msg.text)
-                        elif isinstance(msg, str):
-                            content = msg
-                        else:
-                            # Fallback: convert message to string
-                            content = str(msg)
+                        # Extract content from Claude Code SDK message objects
+                        content = self._parse_claude_code_message(msg)
                         
                         if content:
+                            self.log.debug(f"📝 Yielding content (length: {len(content)}): {content[:100]}...")
                             full_response += content
                             yield content
+                        else:
+                            self.log.debug(f"⚪ No content extracted from message #{message_count}")
+                            # For debugging: let's see what this message actually contains
+                            self.log.debug(f"🔍 Message details: {str(msg)[:200]}...")
+                            # Yield a progress indicator to keep the stream alive
+                            if message_count % 5 == 0:  # Every 5th empty message
+                                yield "."
+                    
+                    self.log.info(f"✅ Claude Code streaming completed. Total messages: {message_count}")
                 
                 except Exception as e:
                     self.log.error(f"Error during Claude Code streaming: {e}")
@@ -289,6 +294,85 @@ When working with code or files:
 Remember: You are in a collaborative coding environment. Be helpful, thorough, and safe."""
         
         return enhanced_prompt
+
+    def _parse_claude_code_message(self, msg) -> str:
+        """Parse Claude Code SDK message objects to extract displayable content."""
+        try:
+            # Log the message type and structure for debugging
+            msg_type = type(msg).__name__
+            self.log.debug(f"🔍 Parsing message type: {msg_type}")
+            
+            # Handle different message types from Claude Code SDK
+            
+            # Handle string messages directly
+            if isinstance(msg, str):
+                self.log.debug("✅ Handled as string message")
+                return msg
+            
+            # Handle messages with a result attribute (like ResultMessage)
+            if hasattr(msg, 'result') and msg.result:
+                self.log.debug("✅ Handled as ResultMessage")
+                return str(msg.result)
+            
+            # Handle messages with content list (like messages containing TextBlocks)
+            if hasattr(msg, 'content') and isinstance(msg.content, list):
+                self.log.debug(f"✅ Handled as content list with {len(msg.content)} blocks")
+                content_parts = []
+                for block in msg.content:
+                    if hasattr(block, 'text'):
+                        content_parts.append(str(block.text))
+                    elif hasattr(block, 'content'):
+                        content_parts.append(str(block.content))
+                    else:
+                        content_parts.append(str(block))
+                return ''.join(content_parts)
+            
+            # Handle messages with direct content attribute
+            if hasattr(msg, 'content') and msg.content:
+                self.log.debug("✅ Handled as direct content")
+                return str(msg.content)
+            
+            # Handle messages with text attribute
+            if hasattr(msg, 'text') and msg.text:
+                self.log.debug("✅ Handled as text attribute")
+                return str(msg.text)
+                
+            # Handle SystemMessage and other structured messages - be more permissive
+            if hasattr(msg, 'data') and isinstance(msg.data, dict):
+                # Only skip pure system init messages, allow others through
+                if msg.data.get('type') == 'system' and msg.data.get('subtype') == 'init':
+                    self.log.debug("⚪ Skipped system init message")
+                    return ""
+                    
+            # Handle messages that might have nested structure
+            if hasattr(msg, '__dict__'):
+                # Look for common content fields
+                for field in ['message', 'body', 'value', 'output']:
+                    if hasattr(msg, field):
+                        content = getattr(msg, field)
+                        if content and isinstance(content, (str, int, float)):
+                            self.log.debug(f"✅ Handled as nested field: {field}")
+                            return str(content)
+            
+            # More permissive fallback: convert to string but only filter truly internal messages
+            msg_str = str(msg)
+            
+            # Only skip very specific internal system messages
+            if ('SystemMessage' in msg_str and 'subtype=\'init\'' in msg_str and 'session_id' in msg_str):
+                self.log.debug("⚪ Skipped specific system init message")
+                return ""
+            
+            # Allow all other messages through, even if they're long
+            self.log.debug("✅ Handled as fallback string conversion")
+            return msg_str
+            
+        except Exception as e:
+            self.log.warning(f"❌ Error parsing Claude Code message: {e}")
+            # Fallback to basic string conversion - be permissive in error cases
+            try:
+                return str(msg)
+            except:
+                return ""
 
     def _get_recent_conversation_context(self) -> Optional[str]:
         """Get recent conversation context for better continuity."""
