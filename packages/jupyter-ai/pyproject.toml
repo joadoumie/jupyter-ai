@@ -104,4 +104,5 @@ build_dir = "jupyter_ai/labextension"
 
 [project.entry-points."jupyter_ai.personas"]
 jupyternaut = "jupyter_ai.personas.jupyternaut:JupyternautPersona"
+claude = "jupyter_ai.personas.claude:ClaudePersona"
 ###############################################################################
