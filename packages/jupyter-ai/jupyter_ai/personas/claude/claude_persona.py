@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 from pathlib import Path
 from typing import Any, Optional
@@ -160,8 +161,28 @@ class ClaudePersona(BasePersona):
             # Process file attachments
             context = self.process_attachments(message)
             
+            # Extract active context metadata
+            active_context = self._extract_active_context_metadata(message)
+            
+            # Debug logging for active context
+            if active_context:
+                self.log.info(f"🎯 Active context captured: {active_context.get('activeFile', {}).get('relativePath', 'No active file')}")
+                if active_context.get('activeFile', {}).get('isNotebook'):
+                    active_cell = active_context.get('activeFile', {}).get('activeCell')
+                    if active_cell:
+                        self.log.info(f"📓 Active notebook cell: #{active_cell.get('cellIndex', -1) + 1} ({active_cell.get('cellType', 'unknown')})")
+            else:
+                self.log.info("⚠️ No active context metadata found")
+            
             # Build enhanced system prompt for Claude Code
-            enhanced_system_prompt = self._build_enhanced_system_prompt()
+            enhanced_system_prompt = self._build_enhanced_system_prompt(active_context)
+            
+            # Debug logging for system prompt
+            self.log.info(f"🔧 Enhanced system prompt length: {len(enhanced_system_prompt)}")
+            if "ACTIVE FILE CONTEXT:" in enhanced_system_prompt:
+                context_start = enhanced_system_prompt.find("ACTIVE FILE CONTEXT:")
+                context_section = enhanced_system_prompt[context_start:context_start + 300]
+                self.log.info(f"📋 Active context section: {context_section}...")
             
             # Build the prompt with context if available
             full_prompt = message.body
@@ -182,7 +203,7 @@ class ClaudePersona(BasePersona):
                 cwd=workspace_dir,
                 system_prompt=enhanced_system_prompt,
                 # Enable tools that are safe and useful for Jupyter AI environment
-                allowed_tools=["Read", "Write", "Grep", "Bash", "LS", "Edit"],
+                allowed_tools=["Read", "Write", "Grep", "Bash", "LS", "Edit", "NotebookRead", "NotebookEdit"],
                 permission_mode="acceptEdits"  # Allow Claude Code to make edits
             )
             
@@ -270,30 +291,177 @@ class ClaudePersona(BasePersona):
 
         return runnable
 
-    def _build_enhanced_system_prompt(self) -> str:
+    def _build_enhanced_system_prompt(self, active_context: Optional[dict] = None) -> str:
         """Build an enhanced system prompt for Claude Code with Jupyter AI context."""
         base_prompt = self.system_prompt
         workspace_dir = self.get_workspace_dir()
+        
+        # Build active file context section
+        active_context_section = self._format_active_context(active_context)
         
         enhanced_prompt = f"""{base_prompt}
 
 You are operating within a Jupyter AI environment with the following context:
 - Workspace directory: {workspace_dir}
 - You have access to enhanced Claude Code capabilities for file operations, code analysis, and multi-step problem solving
-- You can read, write, and modify files in the workspace
+- You can read, write, and modify files in the workspace using your Read, Write, Edit, Grep, LS, and Bash tools
 - You can run shell commands safely within the workspace context
 - You should provide helpful, accurate responses while being mindful of the user's development environment
 
-When working with code or files:
-1. Always understand the project structure first
-2. Make targeted, helpful changes
-3. Explain your reasoning and approach
-4. Test changes when possible
-5. Be careful with destructive operations
+{active_context_section}
 
-Remember: You are in a collaborative coding environment. Be helpful, thorough, and safe."""
+When working with code or files:
+1. Always understand the project structure first using your LS and Grep tools
+2. Use your Read tool to examine file contents when needed - don't assume file contents
+3. When users refer to "this file", "current file", or similar context-dependent terms, they likely refer to the currently active file
+4. CONTEXT RELEVANCE: Use judgment to determine when to acknowledge active file/notebook context:
+   - ACKNOWLEDGE when relevant: "fix this", "debug this code", "what's wrong", "improve this", "explain this function", vague requests that could relate to current work
+   - SKIP when clearly unrelated: "create a new library", "what is Python?", "help with a different project"
+   - When in doubt, lean toward mentioning context briefly - it shows awareness and helps users
+5. For notebook cells, use NotebookRead to get full context and NotebookEdit to make changes
+6. Make targeted, helpful changes using your Edit or Write tools
+7. Explain your reasoning and approach
+8. Test changes when possible using your Bash tool
+9. Be careful with destructive operations
+
+Remember: You are in a collaborative coding environment. Be helpful, thorough, and safe. Use good judgment about when active context is relevant to the user's request."""
         
         return enhanced_prompt
+
+    def _extract_active_context_metadata(self, message: Message) -> Optional[dict]:
+        """Extract active context metadata from message attachments."""
+        try:
+            if not message.attachments:
+                return None
+            
+            for attachment_id in message.attachments:
+                attachment_data = self.ychat.get_attachments().get(attachment_id)
+                
+                if (attachment_data and 
+                    isinstance(attachment_data, dict) and 
+                    attachment_data.get('type') == 'file'):
+                    
+                    value = attachment_data.get('value', '')
+                    # Check if this is our special active context attachment
+                    if value.startswith('__active_context__:'):
+                        context_json = value[len('__active_context__:'):]
+                        return json.loads(context_json)
+            
+            return None
+            
+        except Exception as e:
+            self.log.warning(f"Failed to extract active context metadata: {e}")
+            return None
+
+    def _format_active_context(self, active_context: Optional[dict]) -> str:
+        """Format active context information for the system prompt."""
+        if not active_context:
+            return "ACTIVE FILE CONTEXT: No active file context available."
+        
+        try:
+            context_parts = ["ACTIVE FILE CONTEXT:"]
+            
+            # Format currently active file
+            active_file = active_context.get('activeFile')
+            if active_file:
+                cursor_info = ""
+                if active_file.get('cursorPosition'):
+                    cursor = active_file['cursorPosition']
+                    cursor_info = f" (cursor at line {cursor['line']}, column {cursor['column']})"
+                
+                size_info = ""
+                if active_file.get('size'):
+                    size_kb = active_file['size'] / 1024
+                    size_info = f" ({size_kb:.1f}KB)"
+                
+                language_info = ""
+                if active_file.get('language'):
+                    language_info = f" [{active_file['language']}]"
+                
+                # Check if this is a notebook
+                if active_file.get('isNotebook'):
+                    notebook_info = self._format_notebook_context(active_file)
+                    context_parts.append(
+                        f"• Currently active notebook: {active_file['relativePath']}{language_info}{size_info}"
+                    )
+                    context_parts.extend(notebook_info)
+                else:
+                    context_parts.append(
+                        f"• Currently active file: {active_file['relativePath']}{language_info}{size_info}{cursor_info}"
+                    )
+            else:
+                context_parts.append("• No file is currently active in the editor")
+            
+            # Format open tabs
+            open_tabs = active_context.get('openTabs', [])
+            if open_tabs:
+                non_active_tabs = [tab for tab in open_tabs if not tab.get('isActive', False)]
+                if non_active_tabs:
+                    context_parts.append(f"• Other open tabs ({len(non_active_tabs)}):")
+                    for tab in non_active_tabs[:5]:  # Limit to first 5 to avoid clutter
+                        language_info = f" [{tab['language']}]" if tab.get('language') else ""
+                        size_info = f" ({tab['size']/1024:.1f}KB)" if tab.get('size') else ""
+                        notebook_info = " [notebook]" if tab.get('isNotebook') else ""
+                        context_parts.append(f"  - {tab['relativePath']}{language_info}{size_info}{notebook_info}")
+                    
+                    if len(non_active_tabs) > 5:
+                        context_parts.append(f"  ... and {len(non_active_tabs) - 5} more files")
+            
+            # Add workspace context
+            workspace_root = active_context.get('workspaceRoot', '')
+            if workspace_root:
+                context_parts.append(f"• Workspace root: {workspace_root}")
+            
+            return "\n".join(context_parts)
+            
+        except Exception as e:
+            self.log.warning(f"Error formatting active context: {e}")
+            return "ACTIVE FILE CONTEXT: Error formatting context information."
+
+    def _format_notebook_context(self, active_file: dict) -> list:
+        """Format notebook-specific context information."""
+        context_parts = []
+        
+        try:
+            total_cells = active_file.get('totalCells', 0)
+            context_parts.append(f"  - Total cells: {total_cells}")
+            
+            active_cell = active_file.get('activeCell')
+            if active_cell:
+                cell_type = active_cell.get('cellType', 'unknown')
+                cell_index = active_cell.get('cellIndex', -1)
+                
+                cell_info = f"  - Active cell: #{cell_index + 1} ({cell_type})"
+                
+                # Add execution info for code cells
+                if cell_type == 'code':
+                    execution_count = active_cell.get('executionCount')
+                    has_output = active_cell.get('hasOutput', False)
+                    
+                    exec_info = []
+                    if execution_count is not None:
+                        exec_info.append(f"exec count: {execution_count}")
+                    if has_output:
+                        exec_info.append("has output")
+                    
+                    if exec_info:
+                        cell_info += f" [{', '.join(exec_info)}]"
+                
+                context_parts.append(cell_info)
+                
+                # Add source preview if available
+                source = active_cell.get('source')
+                if source:
+                    source_preview = source[:100].replace('\n', ' ').strip()
+                    if len(source) > 100:
+                        source_preview += "..."
+                    context_parts.append(f"  - Cell content: {source_preview}")
+            
+            return context_parts
+            
+        except Exception as e:
+            self.log.warning(f"Error formatting notebook context: {e}")
+            return ["  - Error formatting notebook context"]
 
     def _parse_claude_code_message(self, msg) -> str:
         """Parse Claude Code SDK message objects to extract displayable content."""
