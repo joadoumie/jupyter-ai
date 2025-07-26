@@ -210,9 +210,9 @@ class ClaudePersona(BasePersona):
                             self.log.debug(f"⚪ No content extracted from message #{message_count}")
                             # For debugging: let's see what this message actually contains
                             self.log.debug(f"🔍 Message details: {str(msg)[:200]}...")
-                            # Yield a progress indicator to keep the stream alive
-                            if message_count % 5 == 0:  # Every 5th empty message
-                                yield "."
+                            # Only yield progress indicator if we haven't had any content for a while
+                            if message_count % 20 == 0 and not full_response:  # Much less frequent
+                                yield "..."
                     
                     self.log.info(f"✅ Claude Code streaming completed. Total messages: {message_count}")
                 
@@ -298,81 +298,108 @@ Remember: You are in a collaborative coding environment. Be helpful, thorough, a
     def _parse_claude_code_message(self, msg) -> str:
         """Parse Claude Code SDK message objects to extract displayable content."""
         try:
-            # Log the message type and structure for debugging
-            msg_type = type(msg).__name__
-            self.log.debug(f"🔍 Parsing message type: {msg_type}")
+            msg_str = str(msg)
+            
+            # First, aggressively filter out tool use and metadata patterns
+            skip_patterns = [
+                'ToolUseBlock(',
+                'tool_use_id',
+                'tool_result',
+                'toolu_',
+                "{'tool_use_id':",
+                "'type': 'tool_result'",
+                'SystemMessage',
+                'session_id',
+                'duration_ms',
+                'total_cost_usd',
+                'usage',
+                'cache_',
+                'api_ms',
+                'num_turns',
+                'service_tier',
+                'model_id',
+                'mcp_servers',
+                'tools',
+                'permissionMode',
+                'name=\'',
+                'input={',
+                'NotebookRead',
+                'NotebookEdit',
+                'Write',
+                'Read',
+                'Edit',
+                'Bash',
+                'LS',
+                'Grep',
+                "'content': [",
+                "'type': 'text'"
+            ]
+            
+            # If the message contains ANY tool use or metadata patterns, skip it entirely
+            if any(pattern in msg_str for pattern in skip_patterns):
+                return ""
+            
+            # Skip very long messages that are likely metadata dumps
+            if len(msg_str) > 500:
+                return ""
+            
+            # Skip messages that look like JSON or dictionary structures
+            if msg_str.strip().startswith(('{', '[')):
+                return ""
             
             # Handle different message types from Claude Code SDK
             
-            # Handle string messages directly
+            # Handle string messages directly (but only if they don't contain tool patterns)
             if isinstance(msg, str):
-                self.log.debug("✅ Handled as string message")
                 return msg
             
             # Handle messages with a result attribute (like ResultMessage)
             if hasattr(msg, 'result') and msg.result:
-                self.log.debug("✅ Handled as ResultMessage")
-                return str(msg.result)
+                result_str = str(msg.result)
+                # Double-check the result doesn't contain tool patterns
+                if not any(pattern in result_str for pattern in skip_patterns):
+                    return result_str
+                return ""
             
             # Handle messages with content list (like messages containing TextBlocks)
             if hasattr(msg, 'content') and isinstance(msg.content, list):
-                self.log.debug(f"✅ Handled as content list with {len(msg.content)} blocks")
                 content_parts = []
                 for block in msg.content:
                     if hasattr(block, 'text'):
-                        content_parts.append(str(block.text))
+                        text = str(block.text)
+                        # Only include text that doesn't contain tool patterns
+                        if not any(pattern in text for pattern in skip_patterns):
+                            content_parts.append(text)
                     elif hasattr(block, 'content'):
-                        content_parts.append(str(block.content))
-                    else:
-                        content_parts.append(str(block))
+                        content = str(block.content)
+                        if not any(pattern in content for pattern in skip_patterns):
+                            content_parts.append(content)
                 return ''.join(content_parts)
             
             # Handle messages with direct content attribute
             if hasattr(msg, 'content') and msg.content:
-                self.log.debug("✅ Handled as direct content")
-                return str(msg.content)
+                content_str = str(msg.content)
+                if not any(pattern in content_str for pattern in skip_patterns):
+                    return content_str
+                return ""
             
             # Handle messages with text attribute
             if hasattr(msg, 'text') and msg.text:
-                self.log.debug("✅ Handled as text attribute")
-                return str(msg.text)
+                text_str = str(msg.text)
+                if not any(pattern in text_str for pattern in skip_patterns):
+                    return text_str
+                return ""
                 
-            # Handle SystemMessage and other structured messages - be more permissive
+            # Skip all system messages and metadata
             if hasattr(msg, 'data') and isinstance(msg.data, dict):
-                # Only skip pure system init messages, allow others through
-                if msg.data.get('type') == 'system' and msg.data.get('subtype') == 'init':
-                    self.log.debug("⚪ Skipped system init message")
-                    return ""
-                    
-            # Handle messages that might have nested structure
-            if hasattr(msg, '__dict__'):
-                # Look for common content fields
-                for field in ['message', 'body', 'value', 'output']:
-                    if hasattr(msg, field):
-                        content = getattr(msg, field)
-                        if content and isinstance(content, (str, int, float)):
-                            self.log.debug(f"✅ Handled as nested field: {field}")
-                            return str(content)
-            
-            # More permissive fallback: convert to string but only filter truly internal messages
-            msg_str = str(msg)
-            
-            # Only skip very specific internal system messages
-            if ('SystemMessage' in msg_str and 'subtype=\'init\'' in msg_str and 'session_id' in msg_str):
-                self.log.debug("⚪ Skipped specific system init message")
                 return ""
             
-            # Allow all other messages through, even if they're long
-            self.log.debug("✅ Handled as fallback string conversion")
-            return msg_str
+            # If we get here, it's likely not user-facing content
+            return ""
             
         except Exception as e:
-            self.log.warning(f"❌ Error parsing Claude Code message: {e}")
-            # Fallback to basic string conversion - be permissive in error cases
-            try:
-                return str(msg)
-            except:
-                return ""
+            self.log.warning(f"Error parsing Claude Code message: {e}")
+            return ""
 
     def _get_recent_conversation_context(self) -> Optional[str]:
         """Get recent conversation context for better continuity."""
