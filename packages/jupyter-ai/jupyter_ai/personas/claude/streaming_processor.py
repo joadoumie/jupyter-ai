@@ -1,22 +1,53 @@
 """
 Streaming processor for Claude Agent SDK responses.
+
+Uses ClaudeSDKClient for continuous conversations with maintained context.
+The SDK automatically handles tool execution and streams messages via receive_response().
 """
 import time
 import json
-from typing import Optional, List, Dict, Any
+from typing import Optional, Dict, Any
 from logging import Logger
 from jupyterlab_chat.models import Message, NewMessage
 from jupyterlab_chat.ychat import YChat
-from claude_agent_sdk import query, ClaudeAgentOptions, HookMatcher
-from claude_agent_sdk.types import AssistantMessage, TextBlock, ToolUseBlock, ToolResultBlock, UserMessage, SystemMessage, ResultMessage
+from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions
+from claude_agent_sdk.types import AssistantMessage, TextBlock, ToolUseBlock, ToolResultBlock
 
 from ...personas.persona_awareness import PersonaAwareness
 from .tool_adapter import render_tool_calls
 
 
+def create_agent_options(
+    system_prompt: str,
+    model: str,
+    mcp_config: Optional[dict],
+    logger: Logger,
+) -> ClaudeAgentOptions:
+    """Create ClaudeAgentOptions with the given configuration."""
+    if mcp_config:
+        mcp_servers = mcp_config
+        logger.info(f"Using MCP servers from config: {list(mcp_servers.keys())}")
+    else:
+        mcp_servers = {
+            "demo": {
+                "command": "npx",
+                "args": ["-y", "@modelcontextprotocol/server-everything"]
+            }
+        }
+        logger.info(f"No MCP config found, using demo server")
+
+    return ClaudeAgentOptions(
+        system_prompt=system_prompt,
+        model=model,
+        mcp_servers=mcp_servers,
+        permission_mode='bypassPermissions',
+    )
+
+
 class StreamingProcessor:
     """
     Processes streaming responses from Claude Agent SDK and updates YChat.
+    Handles continuous conversations with maintained context across messages.
     """
 
     def __init__(
@@ -31,133 +62,39 @@ class StreamingProcessor:
         self.logger = logger
         self.awareness = awareness
 
-        # State tracking
+        # Current message state - track elements in order
         self.message_id: Optional[str] = None
-        self.message_parts: List[str] = []  # Ordered list of text and tool call UI elements
-        self.tool_calls: Dict[str, Dict[str, Any]] = {}  # Maps tool_use_id -> tool call data
-        self.tool_call_positions: Dict[str, int] = {}  # Maps tool_use_id -> position in message_parts
+        self.message_elements: list = []  # Ordered list of ('text', content) or ('tool', tool_id)
+        self.tool_calls: Dict[str, Dict[str, Any]] = {}  # tool_use_id -> tool data
 
-    def _create_pre_tool_hook(self):
-        """Create a pre-tool hook that captures the instance context."""
-        async def pre_tool_hook(input_data: dict, tool_use_id: str, context: dict) -> dict:
-            """Hook called before a tool is executed."""
-            self.logger.info(f"PreToolUse: {input_data.get('tool_name')} with id {tool_use_id}")
-
-            # Store tool call information
-            self.tool_calls[tool_use_id] = {
-                'tool_id': tool_use_id,
-                'index': len(self.tool_calls),
-                'type': 'function',  # Must be 'function' per JaiToolCallProps
-                'function_name': input_data.get('tool_name', 'unknown'),
-                'function_args': json.dumps(input_data.get('tool_input', {})),
-            }
-
-            # Update UI to show tool is being called
-            await self._update_message()
-            return {}
-
-        return pre_tool_hook
-
-    def _create_post_tool_hook(self):
-        """Create a post-tool hook that captures the instance context."""
-        async def post_tool_hook(input_data: dict, tool_use_id: str, context: dict) -> dict:
-            """Hook called after a tool is executed."""
-            self.logger.info(f"PostToolUse: {input_data.get('tool_name')} with id {tool_use_id}")
-            self.logger.info(f"PostToolUse input_data keys: {input_data.keys()}")
-
-            # Add output to the tool call
-            if tool_use_id in self.tool_calls:
-                # Get tool response - it might be 'tool_response' or 'tool_output'
-                tool_response = input_data.get('tool_response') or input_data.get('tool_output', '')
-
-                # Output should be a JSON string containing the output object
-                output_obj = {
-                    'tool_call_id': tool_use_id,
-                    'role': 'tool',
-                    'name': input_data.get('tool_name', 'unknown'),
-                    'content': str(tool_response)
-                }
-                self.tool_calls[tool_use_id]['output'] = json.dumps(output_obj)
-
-                # Update UI to show tool result
-                await self._update_message()
-            return {}
-
-        return post_tool_hook
-
-    async def process_with_agent_sdk(
+    async def process_with_persistent_client(
         self,
+        sdk_client: ClaudeSDKClient,
         prompt: str,
-        system_prompt: str,
-        model: str = "claude-sonnet-4-5-20250929",
-        mcp_config: Optional[dict] = None,
     ) -> None:
         """
-        Process a user prompt with Claude Agent SDK and stream the response.
+        Process a user prompt using a persistent ClaudeSDKClient.
 
-        Args:
-            prompt: User's input message
-            system_prompt: System prompt for the agent
-            model: Model to use (defaults to Sonnet 4.5)
-            mcp_config: MCP server configuration from Jupyter AI
+        The client maintains conversation history across multiple queries.
+        Uses receive_response() which naturally completes when the response is done.
         """
         try:
             self.awareness.set_local_state_field("isWriting", True)
 
-            self.logger.info(f"=== Starting Claude Agent SDK query ===")
-            self.logger.info(f"Prompt: {prompt}")
-            self.logger.info(f"MCP config from Jupyter AI: {mcp_config}")
+            # Reset state for new response
+            self.message_id = None
+            self.message_elements = []
+            self.tool_calls = {}
 
-            # Create hook functions
-            pre_tool_hook = self._create_pre_tool_hook()
-            post_tool_hook = self._create_post_tool_hook()
+            # Send query to SDK
+            await sdk_client.query(prompt=prompt)
 
-            self.logger.info(f"Created hook functions")
-
-            # Use MCP config from Jupyter AI if available, otherwise create a simple demo server
-            if mcp_config:
-                mcp_servers = mcp_config
-                self.logger.info(f"Using MCP servers from config: {list(mcp_servers.keys())}")
-            else:
-                # Demo: Simple MCP server using npx to run @modelcontextprotocol/server-everything
-                mcp_servers = {
-                    "demo": {
-                        "command": "npx",
-                        "args": ["-y", "@modelcontextprotocol/server-everything"]
-                    }
-                }
-                self.logger.info(f"No MCP config found, using demo server")
-
-            options = ClaudeAgentOptions(
-                system_prompt=system_prompt,
-                model=model,
-                mcp_servers=mcp_servers,
-                permission_mode='bypassPermissions',  # Bypass permission prompts for MCP tools
-                include_partial_messages=True,  # Stream partial messages for smoother text rendering
-                hooks={
-                    'PreToolUse': [HookMatcher(hooks=[pre_tool_hook])],
-                    'PostToolUse': [HookMatcher(hooks=[post_tool_hook])],
-                }
-            )
-
-            self.logger.info(f"Created ClaudeAgentOptions with hooks and MCP servers")
-
-            # Stream messages from Claude Agent SDK
-            self.logger.info(f"Starting message stream...")
-            message_count = 0
-            async for message in query(
-                prompt=prompt,
-                options=options,
-            ):
-                message_count += 1
-                self.logger.info(f"Received message #{message_count}: {type(message).__name__}")
+            # Stream response messages - loop ends naturally when response is complete
+            async for message in sdk_client.receive_response():
                 await self._handle_message(message)
-
-            self.logger.info(f"=== Finished Claude Agent SDK query ===")
 
         except Exception as e:
             self.logger.exception(f"Error processing with Claude Agent SDK: {e}")
-            # Send error message to chat
             self.ychat.add_message(NewMessage(
                 sender=self.persona_id,
                 body=f"An error occurred: {str(e)}"
@@ -166,34 +103,41 @@ class StreamingProcessor:
             self.awareness.set_local_state_field("isWriting", False)
 
     async def _handle_message(self, message: Any) -> None:
-        """Handle a single message from the Agent SDK stream."""
-        self.logger.info(f"Handling message: {type(message).__name__}")
+        """Handle a message from the SDK stream."""
+        self.logger.info(f"Received message type: {type(message).__name__}")
 
         if isinstance(message, AssistantMessage):
             await self._handle_assistant_message(message)
-        elif isinstance(message, ResultMessage):
-            await self._handle_result_message(message)
-        elif isinstance(message, UserMessage):
-            await self._handle_user_message(message)
-        elif isinstance(message, SystemMessage):
-            self.logger.info(f"SystemMessage: {message}")
+        elif hasattr(message, 'content') and isinstance(message.content, list):
+            # Handle UserMessage or any message with content blocks
+            await self._handle_content_blocks(message.content)
+        else:
+            self.logger.info(f"Unhandled message type: {type(message).__name__}, content: {message}")
 
     async def _handle_assistant_message(self, message: AssistantMessage) -> None:
-        """Handle an AssistantMessage from the Agent SDK."""
-        self.logger.info(f"AssistantMessage content blocks: {len(message.content)}")
+        """Handle AssistantMessage - delegates to content block handler."""
+        await self._handle_content_blocks(message.content)
 
-        # Process content blocks - with include_partial_messages=True,
-        # each AssistantMessage contains incremental updates
-        for i, block in enumerate(message.content):
-            self.logger.info(f"Block {i}: {type(block).__name__}")
+    async def _handle_content_blocks(self, content_blocks: list) -> None:
+        """
+        Handle content blocks from any message type.
+
+        Blocks arrive in order and we need to preserve that order in the UI.
+        Text and tool calls should appear exactly as they stream in.
+        """
+        self.logger.info(f"Processing {len(content_blocks)} content blocks")
+
+        for block in content_blocks:
+            self.logger.info(f"  Block type: {type(block).__name__}")
 
             if isinstance(block, TextBlock):
-                # Append text incrementally as it streams in
-                self.message_parts.append(block.text)
-            elif isinstance(block, ToolUseBlock):
-                self.logger.info(f"ToolUseBlock found: {block.name} with id {block.id}, input: {block.input}")
+                # Add text element
+                self.message_elements.append(('text', block.text))
+                self.logger.info(f"  TextBlock: {repr(block.text[:100])}")
 
-                # Store tool call info if not already stored
+            elif isinstance(block, ToolUseBlock):
+                self.logger.info(f"  ToolUseBlock: {block.name} (id={block.id})")
+                # Add tool call if not already tracked
                 if block.id not in self.tool_calls:
                     self.tool_calls[block.id] = {
                         'tool_id': block.id,
@@ -202,27 +146,13 @@ class StreamingProcessor:
                         'function_name': block.name,
                         'function_args': json.dumps(block.input),
                     }
+                    # Add tool element marker
+                    self.message_elements.append(('tool', block.id))
+                    self.logger.info(f"  Added tool call {block.id}")
 
-                    # Render tool call UI and add to message parts
-                    tool_call_ui = render_tool_calls([self.tool_calls[block.id]])
-                    position = len(self.message_parts)
-                    self.message_parts.append(tool_call_ui)
-                    self.tool_call_positions[block.id] = position
-
-        # Update or create message in YChat
-        await self._update_message()
-
-    async def _handle_user_message(self, message: UserMessage) -> None:
-        """Handle a UserMessage from the Agent SDK - contains tool results."""
-        self.logger.info(f"UserMessage content blocks: {len(message.content)}")
-
-        # Process content blocks - looking for ToolResultBlock
-        for i, block in enumerate(message.content):
-            self.logger.info(f"UserMessage Block {i}: {type(block).__name__}")
-
-            if isinstance(block, ToolResultBlock):
-                self.logger.info(f"ToolResultBlock found for tool_use_id: {block.tool_use_id}, content length: {len(str(block.content))}")
-                # Add output to existing tool call
+            elif isinstance(block, ToolResultBlock):
+                self.logger.info(f"  ToolResultBlock for tool_use_id={block.tool_use_id}")
+                # Tool result - add output to existing tool call
                 if block.tool_use_id in self.tool_calls:
                     output_obj = {
                         'tool_call_id': block.tool_use_id,
@@ -231,45 +161,43 @@ class StreamingProcessor:
                         'content': str(block.content)
                     }
                     self.tool_calls[block.tool_use_id]['output'] = json.dumps(output_obj)
-                    self.logger.info(f"Set output for tool {block.tool_use_id} in UserMessage")
-
-                    # Re-render this specific tool call with output and update its position
-                    if block.tool_use_id in self.tool_call_positions:
-                        position = self.tool_call_positions[block.tool_use_id]
-                        updated_tool_ui = render_tool_calls([self.tool_calls[block.tool_use_id]])
-                        self.message_parts[position] = updated_tool_ui
-
-                    # Update UI with tool result
-                    await self._update_message()
+                    self.logger.info(f"  Added output to tool call {block.tool_use_id}")
                 else:
-                    self.logger.warning(f"Received ToolResultBlock in UserMessage for unknown tool_use_id: {block.tool_use_id}")
+                    self.logger.warning(f"  ToolResultBlock for unknown tool_use_id: {block.tool_use_id}")
 
-    async def _handle_result_message(self, message: ResultMessage) -> None:
-        """Handle a ResultMessage from the Agent SDK."""
-        self.logger.info(f"ResultMessage: {message}")
+        await self._update_ui()
 
-    async def _update_message(self) -> None:
-        """Update the message in YChat with current content and tool calls."""
-        # Join all message parts in order (text and tool calls inline)
-        message_body = "".join(self.message_parts).strip()
+    async def _update_ui(self) -> None:
+        """
+        Update the chat UI with elements in order.
 
-        # Debug logging
-        self.logger.info(f"Updating message - parts count: {len(self.message_parts)}, tool_calls: {len(self.tool_calls)}")
+        Render message_elements in the exact order they were received,
+        inserting tool call UI where tool elements appear.
+        """
+        parts = []
+
+        for element_type, element_data in self.message_elements:
+            if element_type == 'text':
+                parts.append(element_data)
+            elif element_type == 'tool':
+                # Render this specific tool call
+                tool_id = element_data
+                if tool_id in self.tool_calls:
+                    tool_ui = render_tool_calls([self.tool_calls[tool_id]])
+                    parts.append(tool_ui)
+
+        body = "\n\n".join(parts) if parts else ""
 
         if not self.message_id:
-            # Create new message
             self.message_id = self.ychat.add_message(NewMessage(
                 sender=self.persona_id,
-                body=message_body
+                body=body
             ))
         else:
-            # Update existing message
-            self.ychat.update_message(
-                Message(
-                    id=self.message_id,
-                    body=message_body,
-                    time=time.time(),
-                    sender=self.persona_id,
-                    raw_time=False,
-                )
-            )
+            self.ychat.update_message(Message(
+                id=self.message_id,
+                body=body,
+                time=time.time(),
+                sender=self.persona_id,
+                raw_time=False,
+            ))

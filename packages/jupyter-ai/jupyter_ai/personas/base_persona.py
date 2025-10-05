@@ -316,25 +316,40 @@ class BasePersona(ABC, LoggingConfigurable, metaclass=ABCLoggingConfigurableMeta
     def resolve_attachment_to_path(self, attachment_id: str) -> Optional[str]:
         """
         Resolve an attachment ID to its file path using multiple strategies.
+        Ensures the resolved path is always absolute.
         """
 
         try:
             attachment_data = self.ychat.get_attachments().get(attachment_id)
+            self.log.info(f"Attachment data for {attachment_id}: {attachment_data}")
 
             if attachment_data and isinstance(attachment_data, dict):
                 # If attachment has a 'value' field with filename
                 if "value" in attachment_data:
                     filename = attachment_data["value"]
+                    self.log.info(f"Attachment filename: {filename}")
 
-                    # Try relative to workspace directory
-                    workspace_path = os.path.join(self.get_workspace_dir(), filename)
-                    if os.path.exists(workspace_path):
-                        return workspace_path
+                    # If already absolute path
+                    if os.path.isabs(filename):
+                        if os.path.exists(filename):
+                            resolved = os.path.abspath(filename)
+                            self.log.info(f"Resolved to absolute path: {resolved}")
+                            return resolved
+                        else:
+                            self.log.warning(f"Absolute path does not exist: {filename}")
+                    else:
+                        # Try relative to workspace directory
+                        workspace_dir = self.get_workspace_dir()
+                        workspace_path = os.path.join(workspace_dir, filename)
+                        self.log.info(f"Trying workspace path: {workspace_path}")
+                        if os.path.exists(workspace_path):
+                            resolved = os.path.abspath(workspace_path)
+                            self.log.info(f"Resolved to workspace path: {resolved}")
+                            return resolved
+                        else:
+                            self.log.warning(f"Workspace path does not exist: {workspace_path}")
 
-                    # Try as absolute path
-                    if os.path.exists(filename):
-                        return filename
-
+            self.log.warning(f"Could not resolve attachment {attachment_id}")
             return None
 
         except Exception as e:
