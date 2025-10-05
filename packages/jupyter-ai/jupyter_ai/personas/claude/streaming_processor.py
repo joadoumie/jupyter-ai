@@ -133,6 +133,7 @@ class StreamingProcessor:
                 model=model,
                 mcp_servers=mcp_servers,
                 permission_mode='bypassPermissions',  # Bypass permission prompts for MCP tools
+                include_partial_messages=True,  # Stream partial messages for smoother text rendering
                 hooks={
                     'PreToolUse': [HookMatcher(hooks=[pre_tool_hook])],
                     'PostToolUse': [HookMatcher(hooks=[post_tool_hook])],
@@ -143,11 +144,13 @@ class StreamingProcessor:
 
             # Stream messages from Claude Agent SDK
             self.logger.info(f"Starting message stream...")
+            message_count = 0
             async for message in query(
                 prompt=prompt,
                 options=options,
             ):
-                self.logger.info(f"Received message type: {type(message).__name__}")
+                message_count += 1
+                self.logger.info(f"Received message #{message_count}: {type(message).__name__}")
                 await self._handle_message(message)
 
             self.logger.info(f"=== Finished Claude Agent SDK query ===")
@@ -179,29 +182,32 @@ class StreamingProcessor:
         """Handle an AssistantMessage from the Agent SDK."""
         self.logger.info(f"AssistantMessage content blocks: {len(message.content)}")
 
-        # Process content blocks in order, building message_parts
+        # Process content blocks - with include_partial_messages=True,
+        # each AssistantMessage contains incremental updates
         for i, block in enumerate(message.content):
             self.logger.info(f"Block {i}: {type(block).__name__}")
 
             if isinstance(block, TextBlock):
-                # Add text to message parts
+                # Append text incrementally as it streams in
                 self.message_parts.append(block.text)
             elif isinstance(block, ToolUseBlock):
                 self.logger.info(f"ToolUseBlock found: {block.name} with id {block.id}, input: {block.input}")
-                # Store tool call info
-                self.tool_calls[block.id] = {
-                    'tool_id': block.id,
-                    'index': len(self.tool_calls),
-                    'type': 'function',
-                    'function_name': block.name,
-                    'function_args': json.dumps(block.input),
-                }
 
-                # Render tool call UI and add to message parts
-                tool_call_ui = render_tool_calls([self.tool_calls[block.id]])
-                position = len(self.message_parts)
-                self.message_parts.append(tool_call_ui)
-                self.tool_call_positions[block.id] = position
+                # Store tool call info if not already stored
+                if block.id not in self.tool_calls:
+                    self.tool_calls[block.id] = {
+                        'tool_id': block.id,
+                        'index': len(self.tool_calls),
+                        'type': 'function',
+                        'function_name': block.name,
+                        'function_args': json.dumps(block.input),
+                    }
+
+                    # Render tool call UI and add to message parts
+                    tool_call_ui = render_tool_calls([self.tool_calls[block.id]])
+                    position = len(self.message_parts)
+                    self.message_parts.append(tool_call_ui)
+                    self.tool_call_positions[block.id] = position
 
         # Update or create message in YChat
         await self._update_message()
