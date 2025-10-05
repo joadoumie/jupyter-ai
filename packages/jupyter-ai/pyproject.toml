@@ -40,6 +40,7 @@ dependencies = [
     "jinja2>=3.0,<4",
     "python_dotenv>=1,<2",
     "pocketflow==0.0.3",
+    "claude-agent-sdk>=0.1.0",
 ]
 
 dynamic = ["version", "description", "authors", "urls", "keywords"]
@@ -108,4 +109,5 @@ build_dir = "jupyter_ai/labextension"
 
 [project.entry-points."jupyter_ai.personas"]
 jupyternaut = "jupyter_ai.personas.jupyternaut:JupyternautPersona"
+claude = "jupyter_ai.personas.claude:ClaudeAgentPersona"
 ###############################################################################
